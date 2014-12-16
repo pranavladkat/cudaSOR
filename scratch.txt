@@ -1,0 +1,621 @@
+
+odd kernel =====>
+
+CPU:
+
+cout << "element : " << odd[odd_index] << endl;
+cout << "j-1 : " << even[even_index-height_even] << endl ;
+cout << "j+1 : " << even[even_index+height_even] << endl ;
+cout << "i-1 : " << (i%2)*even[even_index-1]+(1-i%2)*even[even_index] << endl ;
+cout << "i+1 : " << (i%2)*even[even_index]+(1-i%2)*even[even_index+1] << endl ;
+
+GPU:
+
+          buffer[odd_index] = odd[odd_index];
+          buffer[odd_index-height_odd] = even[even_index-height_even];
+          buffer[odd_index+height_odd] = even[even_index+height_even];
+          buffer[odd_index-1] = (tx%2)*even[even_index-1]+(1-tx%2)*even[even_index];
+          buffer[odd_index+1] = (tx%2)*even[even_index]+(1-tx%2)*even[even_index+1];
+
+
+even kernel =====>
+
+CPU:
+
+cout << "element : " << even[even_index] << endl;
+cout << "j-1 : " << odd[odd_index-height_odd] << endl;
+cout << "j+1 : " << odd[odd_index+height_odd] << endl;
+cout << "i-1 : " << (1-i%2)*odd[odd_index-1] + (i%2)*odd[odd_index] << endl;
+cout << "i+1 : " << (1-i%2)*odd[odd_index] + (i%2)*odd[odd_index+1] << endl;
+
+GPU:
+
+          buffer[even_index] = even[even_index];
+          buffer[even_index-height_even] = odd[odd_index-height_odd];
+          buffer[even_index+height_even] = odd[odd_index+height_odd];
+          buffer[even_index-1] = (1-tx%2)*odd[odd_index-1] + (tx%2)*odd[odd_index];
+          buffer[even_index+1] = (1-tx%2)*odd[odd_index] + (tx%2)*odd[odd_index+1];
+          
+
+          
+old code :
+
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <cmath>
+#include <ctime>
+
+using namespace std;
+
+// global variables
+size_t const BLOCK_SIZE = 16;
+size_t const width = 400;
+size_t const height = 400;
+size_t const height_odd = (height/2);
+size_t const height_even = (height - height_odd);
+size_t itmax = 1000;
+double const omega = 1.9;
+double const beta = (((1.0/width) / (1.0/height))*((1.0/width) / (1.0/height)));
+
+// functions
+__global__ void exactsol_kernel(const double*,const double*,double*);
+void generategrid(double*,double*,const double,const double,const double,const double);
+void setBC(double*, double*, const double*, const double*);
+void solve_sor_cuda(double*,double*);
+__global__ void solve_jacobi(double*,double*);
+void host_jacobi(double*,double*);
+__global__ void solve_odd(double*,double*);
+__global__ void solve_even(double*,double*);
+__global__ void merge_oddeven(double*,double*);
+void host_sor(double*,double*);
+void sor_reordered(double*);
+void host_odd_update(double*,double*);
+void host_even_update(double*,double*);
+void get_solution(double*,double*, double*);
+void cuda_sor_reordered(double*,double*,double*);
+__global__ void cuda_odd_update(double*,double*);
+__global__ void cuda_even_update(double*,double*);
+// boundary conditions
+double leftBC(const double&, const double&);
+double rightBC(const double&, const double&);
+double topBC(const double&, const double&);
+double bottomBC(const double&, const double&);
+
+int main(){
+
+  //host variables
+  double *x = NULL, *y = NULL;        // grid x and y
+  double Xmin = 0.0, Xmax = 1.0,
+         Ymin = 0.0, Ymax = 1.0;    // grid coordinates bounds
+  double *sol, *sol_old;
+
+  // device variable
+  double *dev_sol, *dev_sol_old;
+  double *dev_x, *dev_y;
+
+
+  size_t memsize = width*height;
+
+  x = new double [memsize];
+  y = new double [memsize];
+  generategrid(x,y,Xmin,Xmax,Ymin,Ymax);        // generate grid
+
+  sol = new double [memsize];                   // allocate sol memory + set it to zero
+  sol_old = new double [memsize];
+  for(int i = 0; i < width; i++){
+    for(int j = 0; j < height; j++){
+        sol[i*height + j] = 0.0;
+        sol_old[i*height + j] = 0.0;
+    }
+  }
+
+  setBC(sol,sol_old,x,y);               // set boundary conditions
+
+  // allocate device memory
+  cudaMalloc(&dev_x, memsize*sizeof(double));
+  cudaMalloc(&dev_y, memsize*sizeof(double));
+  cudaMalloc(&dev_sol, memsize*sizeof(double));
+  cudaMalloc(&dev_sol_old, memsize*sizeof(double));
+
+  // copy host to device
+  cudaMemcpy( dev_x, x, memsize*sizeof(double), cudaMemcpyHostToDevice );
+  cudaMemcpy( dev_y, y, memsize*sizeof(double), cudaMemcpyHostToDevice );
+  cudaMemcpy( dev_sol, sol, memsize*sizeof(double), cudaMemcpyHostToDevice );
+  cudaMemcpy( dev_sol_old, sol, memsize*sizeof(double), cudaMemcpyHostToDevice );
+
+
+  solve_sor_cuda(dev_sol, dev_sol_old);
+  //sor_reordered(sol);
+
+
+  double stime = clock();
+  host_sor(sol,sol_old);
+  double etime = clock();
+  cout << "CPU time : " << (etime-stime)/CLOCKS_PER_SEC << endl;
+
+
+  cudaMemcpy( sol, dev_sol, memsize*sizeof(double), cudaMemcpyDeviceToHost );
+
+  ofstream file("cusol.dat");
+  for(int i = 0; i < width; i++){
+    for(int j = 0; j < height; j++){
+      file << setw(12) << sol[i*height + j];
+    }
+    file << endl;
+  }
+  file.close();
+
+  delete [] x;
+  delete [] y;
+  delete [] sol;
+  delete [] sol_old;
+  cudaFree(dev_x);
+  cudaFree(dev_y);
+  cudaFree(dev_sol);
+  cudaFree(dev_sol_old);
+
+  cout << "End!" << endl;
+  return 0;
+}
+
+
+
+
+__global__ void exactsol_kernel(const double* x, const double* y,double* sol)
+{
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+
+  if(tx < width && ty < height){
+      sol[index] = sin(M_PI*x[index])*exp(-M_PI*y[index]);
+  }
+}
+
+
+
+void generategrid(double* x,double* y,const double Xmin,const double Xmax,const double Ymin,const double Ymax){
+
+  double dx = fabs(Xmax-Xmin)/(width-1);
+  double dy = fabs(Ymax-Ymin)/(height-1);
+
+  for(size_t i = 0; i < width; i++){
+      for(size_t j = 0; j < height; j++){
+          x[i*height + j] = Xmin + i*dx;
+          y[i*height + j] = Ymin + j*dy;
+          //cout << setw(12) << y[i*height + j];
+      }
+      //cout << endl;
+  }
+}
+
+
+void setBC(double* sol, double* sol_old,const double* x, const double* y){
+
+  for(size_t i = 0; i < width; i++){
+      for(size_t j = 0; j < height; j++){
+
+          size_t index = i*height + j ;
+          if(i == 0){
+              sol[index] = leftBC(x[index],y[index]);
+              sol_old[index] = leftBC(x[index],y[index]);
+          }
+          if(i == width-1){
+              sol[index] = rightBC(x[index],y[index]);
+              sol_old[index] = rightBC(x[index],y[index]);
+          }
+          if(j == 0){
+              sol[index] = bottomBC(x[index],y[index]);
+              sol_old[index] = bottomBC(x[index],y[index]);
+          }
+          if(j == height-1){
+              sol[index] = topBC(x[index],y[index]);
+              sol_old[index] = topBC(x[index],y[index]);
+          }
+      }
+  }
+}
+
+
+// boundary conditions
+double leftBC(const double& x, const double& y){
+  return 0;
+}
+
+double rightBC(const double& x, const double& y){
+  return 0;
+}
+
+double topBC(const double& x, const double& y){
+  return sin(M_PI*x)*exp(-M_PI);
+}
+
+double bottomBC(const double& x, const double& y){
+  return sin(M_PI*x);
+}
+
+
+void solve_sor_cuda(double* sol,double* sol_old){
+
+  int gridx = (width-1)/BLOCK_SIZE + 1;
+  int gridy = (height-1)/BLOCK_SIZE + 1;
+  dim3 dimBlock(BLOCK_SIZE,BLOCK_SIZE,1);
+  dim3 dimGrid(gridx,gridy,1);
+
+  double stime = clock();
+  for(size_t it = 0; it < itmax; it++){
+      solve_odd <<<dimGrid,dimBlock>>> (sol,sol_old);
+      solve_even <<<dimGrid,dimBlock>>> (sol,sol_old);
+  }
+  merge_oddeven <<<dimGrid,dimBlock>>> (sol,sol_old);
+  double etime = clock();
+  cout << "GPU time : " << (etime-stime)/CLOCKS_PER_SEC << endl;
+
+}
+
+__global__ void solve_jacobi(double* sol,double* sol_old){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+
+  if(tx > 0 && ty > 0 && tx < width-1 && ty < height-1){
+      sol[index] = 0.25*(sol_old[index+1] + sol_old[index-1] + sol_old[index+height] + sol_old[index-height]) ;
+      sol_old[index] = sol[index];
+  }
+}
+
+void host_jacobi(double* sol,double* sol_old){
+
+  for(size_t it = 0; it < 5000; it++){
+
+      for(size_t i = 0; i < width; i++){
+          for(size_t j = 0; j < height; j++){
+              if(i > 0 && j > 0 && i < width-1 && j < height-1){
+                  size_t index = i*height+j;
+                  sol[index] = 0.25*(sol_old[index+1] + sol_old[index-1] + sol_old[index+height] + sol_old[index-height]) ;
+                  sol_old[index] = sol[index];
+              }
+          }
+      }
+
+  }
+}
+
+
+__global__ void solve_odd(double* sol,double* sol_old){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+  //double beta = pow((1.0/width) / (1.0/height),2);
+
+  // odd
+  if((tx + ty)%2 != 0){
+      if(tx > 0 && ty > 0 && tx < width-1 && ty < height-1){
+          sol_old[index] = (1.0-omega)*sol_old[index] + omega/(2*(1+beta))
+                         *(sol[index+1] + sol[index-1] + beta*(sol[index+height] + sol[index-height]));
+      }
+  }
+}
+
+
+__global__ void solve_even(double* sol,double* sol_old){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+  //double beta = pow((1.0/width) / (1.0/height),2);
+
+  //even
+  if((tx + ty)%2 == 0){
+      if(tx > 0 && ty > 0 && tx < width-1 && ty < height-1){
+          sol[index] = (1.0-omega)*sol[index] + omega/(2*(1+beta))
+                     *(sol_old[index+1] + sol_old[index-1] + beta*(sol_old[index+height] + sol_old[index-height]));
+      }
+  }
+
+}
+
+
+
+__global__ void merge_oddeven(double* sol,double* sol_old){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+
+  if((tx + ty)%2 != 0 && tx < width-1 && ty < height-1){
+      sol[index] = sol_old[index];
+  }
+
+}
+
+
+
+
+
+void host_sor(double* sol,double* sol_old){
+
+  //double beta = pow((1.0/width) / (1.0/height),2);
+
+  for(size_t it = 0; it < itmax; it++){
+      for(size_t i = 0; i < width; i++){
+          for(size_t j = 0; j < height; j++){
+
+              size_t index = i*height+j;
+
+              if(i > 0 && j > 0 && i < width-1 && j < height-1){
+
+                  // odd
+                  if((i + j)%2 != 0){
+                      if(i > 0 && j > 0 && i < width-1 && j < height-1){
+                          sol_old[index] = (1.0-omega)*sol_old[index] + omega/(2*(1+beta))
+                                         *(sol[index+1] + sol[index-1] + beta*(sol[index+height] + sol[index-height]));
+                      }
+                  }
+
+                  //even
+                  if((i + j)%2 == 0){
+                      if(i > 0 && j > 0 && i < width-1 && j < height-1){
+                          sol[index] = (1.0-omega)*sol[index] + omega/(2*(1+beta))
+                                     *(sol_old[index+1] + sol_old[index-1] + beta*(sol_old[index+height] + sol_old[index-height]));
+                      }
+                  }
+
+
+              }
+          }
+      }
+  }
+
+
+}
+
+
+
+
+
+void sor_reordered(double* sol){
+
+  size_t p = 0, q = 0, l = 0, m = 0;
+  double *odd, *even;
+
+//  for(size_t i = 0; i < width; i++){
+//      for(size_t j = 0; j < height; j++){
+//          size_t index = i*height+j;
+//          sol[index] = p;
+//          p++;
+//      }
+//  }
+
+  odd = new double [width*height_odd];
+  even = new double [width*height_even];
+
+  // copy sol values to odd and even arrays
+  p = 0; l = 0;
+  for(size_t i = 0; i < width; i++){
+      q = 0; m = 0;
+      for(size_t j = 0; j < height; j++){
+          if((i+j)%2 != 0){
+              odd[p*height_odd+q] = sol[i*height+j];
+              q++;
+          }
+          if((i+j)%2 == 0){
+              even[l*height_even+m] = sol[i*height+j];
+              m++;
+          }
+      }
+      p++; l++;
+  }
+
+
+// call odd even functions here
+  double stime = clock();
+  for(size_t it = 0; it < itmax; it++){
+      host_odd_update(odd,even);
+      host_even_update(odd,even);
+  }
+  double etime = clock();
+  cout << "Reordered, CPU time : " << (etime-stime)/CLOCKS_PER_SEC << endl;
+  //get_solution(odd,even,sol);
+
+
+  stime = clock();
+  cuda_sor_reordered(odd,even,sol);
+  etime = clock();
+  cout << "Reordered, GPU time : " << (etime-stime)/CLOCKS_PER_SEC << endl;
+  get_solution(odd,even,sol);
+
+
+  // write odd
+  ofstream oddfile("odd.dat");
+  for(size_t i = 0; i < width; i++){
+      for(size_t j = 0; j < height_odd; j++){
+          oddfile << setw(12) << odd[i*height_odd + j];
+      }
+      oddfile << endl;
+  } oddfile.close();
+
+  //write even
+  ofstream evenfile("even.dat");
+    for(size_t i = 0; i < width; i++){
+        for(size_t j = 0; j < height_even; j++){
+            evenfile << setw(12) << even[i*height_even + j];
+        }
+        evenfile << endl;
+    } evenfile.close();
+
+
+  ofstream file("mat.dat");
+  for(int i = 0; i < width; i++){
+      for(int j = 0; j < height; j++){
+          file << setw(12) << sol[i*height + j];
+      }
+      file << endl;
+  } file.close();
+
+
+    delete [] odd;
+    delete [] even;
+}
+
+
+
+// compute odd values from even
+void host_odd_update(double* odd,double* even){
+
+  //double beta = pow((1.0/width) / (1.0/height),2);
+
+  for(size_t i = 1; i < width-1; i++){
+      for(size_t j = 0; j < height_odd; j++){
+
+          size_t even_index = i*height_even+j;
+          size_t odd_index = i*height_odd+j;
+
+          if( (j == 0 && (i+j)%2 == 0) || (j == height_odd-1 && (i+j)%2 == 1) || (j > 0 && j < height_odd-1) ) {
+
+              odd[odd_index] = (1.0 - omega)*odd[odd_index] + omega/(2*(1+beta))
+                  * ( (i%2)*even[even_index]+(1-i%2)*even[even_index+1]
+                    + (i%2)*even[even_index-1]+(1-i%2)*even[even_index]
+                    + beta * ( even[even_index-height_even]
+                             + even[even_index+height_even]   )) ;
+          }
+      }
+  }
+
+}
+
+
+// compute even values from odd
+void host_even_update(double* odd,double* even){
+
+  //double beta = pow((1.0/width) / (1.0/height),2);
+
+  // even kernel loop
+  for(size_t i = 1; i < width-1; i++){
+      for(size_t j = 0; j < height_even; j++){
+          size_t even_index = i*height_even+j;
+          size_t odd_index = i*height_odd+j;
+
+          if( (j == 0 & i%2 == 1) || (j == height_even-1 && i%2 == 0) || (j > 0 && j < height_even-1) ){
+
+              even[even_index] = (1.0 - omega)*even[even_index] + omega/(2*(1+beta))
+                               * ( (1-i%2)*odd[odd_index] + (i%2)*odd[odd_index+1]
+                                 + (1-i%2)*odd[odd_index-1] + (i%2)*odd[odd_index]
+                                 + beta * ( odd[odd_index-height_odd]
+                                 + odd[odd_index+height_odd]  )) ;
+          }
+      }
+  }
+
+}
+
+
+
+
+void get_solution(double* odd,double* even,double* sol){
+
+  size_t p,q,l,m;
+
+  p = 0; l = 0;
+  for(size_t i = 0; i < width; i++){
+      q = 0; m = 0;
+      for(size_t j = 0; j < height; j++){
+          if((i+j)%2 != 0){
+              sol[i*height+j] = odd[p*height_odd+q];
+              q++;
+          }
+          if((i+j)%2 == 0){
+              sol[i*height+j] = even[l*height_even+m];
+              m++;
+          }
+      }
+      p++; l++;
+  }
+
+}
+
+
+
+
+void cuda_sor_reordered(double* host_odd,double* host_even,double* host_sol){
+
+  double *odd = NULL, *even = NULL;
+
+  int gridx = (width-1)/BLOCK_SIZE + 1;
+  int gridy_odd = (height_odd-1)/BLOCK_SIZE + 1;
+  int gridy_even = (height_even-1)/BLOCK_SIZE + 1;
+
+  dim3 dimBlock(BLOCK_SIZE,BLOCK_SIZE,1);
+  dim3 dimGrid_odd(gridx,gridy_odd,1);
+  dim3 dimGrid_even(gridx,gridy_even,1);
+
+  cudaMalloc(&odd, width*height_odd *sizeof(double));
+  cudaMalloc(&even,width*height_even*sizeof(double));
+
+  cudaMemcpy( odd , host_odd , width*height_odd *sizeof(double), cudaMemcpyHostToDevice );
+  cudaMemcpy( even, host_even, width*height_even*sizeof(double), cudaMemcpyHostToDevice );
+
+
+  for(size_t it = 0; it < itmax; it++){
+      cuda_odd_update <<<dimGrid_odd,dimBlock>>> (odd,even);
+      cuda_even_update <<<dimGrid_even,dimBlock>>> (odd,even);
+  }
+
+  cudaMemcpy( host_odd , odd , width*height_odd *sizeof(double), cudaMemcpyDeviceToHost );
+  cudaMemcpy( host_even, even, width*height_even*sizeof(double), cudaMemcpyDeviceToHost );
+
+  cudaFree(odd);
+  cudaFree(even);
+}
+
+
+
+
+
+__global__ void cuda_odd_update(double* odd,double* even){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t odd_index = tx*height_odd+ty;
+  size_t even_index = tx*height_even+ty;
+
+  if (( (ty == 0 && tx%2 == 0) || (ty == height_odd-1 && tx%2 == 1) || (ty > 0 && ty < height_odd-1) ) && (tx > 0 && tx < width-1 && ty < height_odd) ){
+
+      odd[odd_index] = (1.0 - omega)*odd[odd_index] + omega/(2*(1+beta))
+                     * ( (tx%2)*even[even_index]+(1-tx%2)*even[even_index+1]
+                       + (tx%2)*even[even_index-1]+(1-tx%2)*even[even_index]
+                       + beta * ( even[even_index-height_even]
+                                + even[even_index+height_even]   )) ;
+
+  }
+
+}
+
+
+
+
+
+__global__ void cuda_even_update(double* odd,double* even){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t odd_index = tx*height_odd+ty;
+  size_t even_index = tx*height_even+ty;
+
+  if(( (ty == 0 & tx%2 == 1) || (ty == height_even-1 && tx%2 == 0) || (ty > 0 && ty < height_even-1) ) && ( tx > 0 && tx < width-1 && ty < height_even)){
+
+
+      even[even_index] = (1.0 - omega)*even[even_index] + omega/(2*(1+beta))
+                       * ( (1-tx%2)*odd[odd_index] + (tx%2)*odd[odd_index+1]
+                         + (1-tx%2)*odd[odd_index-1] + (tx%2)*odd[odd_index]
+                         + beta * ( odd[odd_index-height_odd]
+                                  + odd[odd_index+height_odd]  )) ;
+
+
+  }
+
+}
+
