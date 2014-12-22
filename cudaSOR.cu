@@ -3,27 +3,29 @@
 #include <iomanip>
 #include <cmath>
 #include <ctime>
+#include <omp.h>
+
 
 using namespace std;
 
 // global variables
 size_t const BLOCK_SIZE = 16;
-size_t const width = 8;
-size_t const height = 8;
-size_t itmax = 3000;
+size_t const width = 800;
+size_t const height = 800;
+size_t itmax = 5000;
 double const omega = 1.97;
 double const beta = (((1.0/width) / (1.0/height))*((1.0/width) / (1.0/height)));
 
 
 // functions
 void generategrid(double*,double*,const double,const double,const double,const double);
-
 void setBC(double*, const double*, const double*);
+void solve_sor_host(double*);
 void solve_sor_cuda(double*);
 __global__ void solve_odd(double*,double*);
 __global__ void solve_even(double*,double*);
 __global__ void merge_oddeven(double*,double*);
-void host_sor(double*,double*);
+void write_output(double*);
 
 
 // boundary conditions
@@ -50,23 +52,17 @@ int main(){
 
   // allocate sol memory + set it to zero
   sol = new double [memsize];
-  memset(sol,memsize,memsize*sizeof(double));
+  memset(sol,0,memsize*sizeof(double));
 
   // set boundary conditions
   setBC(sol,x,y);
 
+  // call solvers
+  //solve_sor_cuda(sol);
+  solve_sor_host(sol);
 
-  solve_sor_cuda(sol);
-
-
-  ofstream file("cusol.dat");
-  for(int i = 0; i < width; i++){
-    for(int j = 0; j < height; j++){
-      file << setw(12) << sol[i*height + j];
-    }
-    file << endl;
-  }
-  file.close();
+  // write output
+  write_output(sol);
 
   delete [] x;
   delete [] y;
@@ -136,61 +132,181 @@ double bottomBC(const double& x, const double& y){
 
 
 
+
 void solve_sor_cuda(double* sol_host){
 
-  int nGPU;
-  int mywidth = width/2;
-  size_t memsize = mywidth*height;
 
-  // get device count
-  cudaGetDeviceCount(&nGPU);
-  cout << nGPU << " cuda devices found." << endl;
+  const int memsize = width*height;
 
+  // device variables -> odd and even
   double *odd, *even;
 
-  odd = new double [memsize];
-  even = new double [memsize];
+  cudaMalloc(&odd,memsize*sizeof(double));
+  cudaMalloc(&even,memsize*sizeof(double));
+  cudaMemset(&odd,0,memsize);
+  cudaMemset(&even,0,memsize);
 
-  int p = 0;
-  for(size_t i = 0; i < width; i++){
-      for(size_t j = 0; j < height; j++){
-          size_t index = i*height+j;
-          sol_host[index] = p;
-          p++;
+  // copy initial guess from host to device memory
+  cudaMemcpy(odd,sol_host,memsize*sizeof(double),cudaMemcpyHostToDevice);
+  cudaMemcpy(even,sol_host,memsize*sizeof(double),cudaMemcpyHostToDevice);
+
+  int gridx = (width-1)/BLOCK_SIZE + 1;
+  int gridy = (height-1)/BLOCK_SIZE + 1;
+  dim3 dimBlock(BLOCK_SIZE,BLOCK_SIZE,1);
+  dim3 dimGrid(gridx,gridy,1);
+
+  cout << "gridx = " << gridx << "\t" << "gridy = " << gridy << endl;
+
+  double stime = clock();
+  for(size_t it = 0; it < itmax; it++){
+      solve_odd <<<dimGrid,dimBlock>>> (odd,even);
+      solve_even <<<dimGrid,dimBlock>>> (odd,even);
+  }
+  merge_oddeven <<<dimGrid,dimBlock>>> (odd,even);
+  double etime = clock();
+  cout << "GPU time : " << (etime-stime)/CLOCKS_PER_SEC << endl;
+
+  // copy solution from device to host memory
+  cudaMemcpy(sol_host,odd,memsize*sizeof(double),cudaMemcpyDeviceToHost);
+
+  cudaFree(odd);
+  cudaFree(even);
+
+}
+
+
+
+__global__ void solve_odd(double* odd,double* even){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+
+  if((tx + ty)%2 != 0){
+      if(tx > 0 && ty > 0 && tx < width-1 && ty < height-1){
+          odd[index] = (1.0-omega)*odd[index] + omega/(2*(1+beta))
+                     *(even[index+1] + even[index-1] + beta*(even[index+height] + even[index-height]));
       }
   }
+}
 
 
-  for(size_t i = 0; i < mywidth; i++){
-      for(size_t j = 0; j < height; j++){
-          size_t index = i*height+j;
-          odd[index] = sol_host[index];
-          //even[index] = sol_host[index+]
-          cout << setw(10) << odd[index] ;
-      }
-      cout << endl;
-  }
+__global__ void solve_even(double* odd,double* even){
 
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+    size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+    size_t index = tx*height+ty;
+    //double beta = pow((1.0/width) / (1.0/height),2);
+
+    //even
+    if((tx + ty)%2 == 0){
+        if(tx > 0 && ty > 0 && tx < width-1 && ty < height-1){
+            even[index] = (1.0-omega)*even[index] + omega/(2*(1+beta))
+                        *(odd[index+1] + odd[index-1] + beta*(odd[index+height] + odd[index-height]));
+        }
+    }
 
 
 }
 
 
 
+__global__ void merge_oddeven(double* odd,double* even){
+
+  size_t tx = blockIdx.x*blockDim.x + threadIdx.x;
+  size_t ty = blockIdx.y*blockDim.y + threadIdx.y;
+  size_t index = tx*height+ty;
+
+  if((tx + ty)%2 == 0 && tx < width-1 && ty < height-1){
+      odd[index] = even[index];
+  }
+
+}
 
 
 
+void solve_sor_host(double* sol){
+
+  const int memsize = width*height;
+  double *odd, *even;
+  size_t i,j, index;
+
+  odd = new double [memsize];
+  even = new double [memsize];
+
+  memcpy(odd,sol,memsize*sizeof(double));
+  memcpy(even,sol,memsize*sizeof(double));
 
 
+  double stime = omp_get_wtime();
+  for(size_t it = 0; it < itmax; it++){
+
+#pragma omp parallel
+{
+#pragma omp for private(i,j,index)
+      // update odd cells
+      for(i = 0; i < width; i++){
+          for(j = 0; j < height; j++){
+              index = i*height+j;
+              if((i + j)%2 != 0){
+                  if(i > 0 && j > 0 && i < width-1 && j < height-1){
+                      odd[index] = (1.0-omega)*odd[index] + omega/(2*(1+beta))
+                                 *(even[index+1] + even[index-1] + beta*(even[index+height] + even[index-height]));
+                  }
+              }
+          }
+      }
+
+#pragma omp for private(i,j,index)
+      // update even cells
+      for(i = 0; i < width; i++){
+          for(j = 0; j < height; j++){
+              index = i*height+j;
+              if((i + j)%2 == 0){
+                  if(i > 0 && j > 0 && i < width-1 && j < height-1){
+                      even[index] = (1.0-omega)*even[index] + omega/(2*(1+beta))
+                                  *(odd[index+1] + odd[index-1] + beta*(odd[index+height] + odd[index-height]));
+                  }
+              }
+          }
+      }
+} // end omp parallel
+
+  } // end iteration loop
+
+#pragma omp parallel for private(i,j,index)
+  // merge odd-even solution
+  for(i = 0; i < width; i++){
+      for(j = 0; j < height; j++){
+          index = i*height+j;
+          if((i + j)%2 == 0){
+              odd[index] = even[index];
+          }
+      }
+  }
+  double etime = omp_get_wtime();
+  cout << "CPU time : " << (etime-stime) << endl;
 
 
+  // copy solution from odd to sol
+  memcpy(sol,odd,memsize*sizeof(double));
+
+  delete [] odd;
+  delete [] even;
+
+}
 
 
+void write_output(double* sol){
 
-
-
-
-
-
+  ofstream file("cusol.dat");
+    for(int i = 0; i < width; i++){
+      for(int j = 0; j < height; j++){
+        file << setw(12) << sol[i*height + j];
+      }
+      file << endl;
+    }
+    file.close();
+}
 
 
