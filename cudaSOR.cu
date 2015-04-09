@@ -58,8 +58,8 @@ int main(){
   setBC(sol,x,y);
 
   // call solvers
-  //solve_sor_cuda(sol);
-  solve_sor_host(sol);
+  solve_sor_cuda(sol);
+  //solve_sor_host(sol);
 
   // write output
   write_output(sol);
